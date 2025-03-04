@@ -10,9 +10,9 @@ import nltk
 from nltk.tokenize import sent_tokenize
 from nltk.corpus import stopwords
 import os
+from urllib.parse import urljoin
 
 nltk.download('punkt_tab')
-
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,7 +33,6 @@ def init_db():
             title TEXT,
             location TEXT,
             team TEXT,
-            posted_date TEXT,
             deadline TEXT,
             summary TEXT,
             link TEXT,
@@ -102,24 +101,124 @@ def is_phd_position(title, description):
     title_lower = title.strip().lower()
     return title_lower.startswith("phd position f/m") or title_lower.startswith("doctorant f/h")
 
+def fetch_jobs():
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        response = requests.get(SCRAPE_URL, headers=headers, timeout=15)
+        response.raise_for_status()
+        logger.info(f"Fetched main page with status {response.status_code}")
+    except requests.RequestException as e:
+        logger.error(f"HTTP error occurred: {e}")
+        return []
+    
+    soup = BeautifulSoup(response.text, 'html.parser')
+    jobs = []
+    
+    # Find job cards
+    job_cards = soup.select("div.job-card")
+    if not job_cards:
+        logger.warning("No job cards found on the main page.")
+        return jobs
+    
+    logger.info(f"Found {len(job_cards)} job cards on the main page.")
+    
+    for idx, card in enumerate(job_cards, start=1):
+        try:
+            # 1) Title
+            title_elem = card.find("h2")
+            if not title_elem:
+                continue
+            title = title_elem.get_text(strip=True)
+            
+            # 2) Parse location, team, deadline from <ul>
+            ul = card.find("ul", class_="list-unstyled infos-liste-offre-inria")
+            location = "Unknown"
+            team = ""
+            deadline = ""
+            if ul:
+                li_tags = ul.find_all("li")
+                for li in li_tags:
+                    li_text = li.get_text(separator=" ", strip=True)
+                    if ":" in li_text:
+                        label, value = li_text.split(":", 1)
+                        label = label.strip().lower()
+                        value = value.strip()
+                        if "town/city" in label:
+                            location = value
+                        elif "inria team" in label:
+                            team = value
+                        elif "deadline" in label:
+                            deadline = value
+            
+            # 3) Extract a link from the card, if it exists
+            link_elem = card.find("a", href=True)
+            if link_elem:
+                raw_link = link_elem["href"]  # e.g. "/public/classic/en/offres/2025-08547"
+                # Make sure it's an absolute URL
+                if not raw_link.startswith("http"):
+                    # Join with the base site URL
+                    job_link = urljoin("https://jobs.inria.fr", raw_link)
+            else:
+                # If there's no <a>, you could guess the link from some known ID
+                # or just skip. For example:
+                job_link = f"https://jobs.inria.fr/public/classic/en/offres/job-{idx}"
+            
+            # 4) Derive a job_id from the link (the last part of the URL)
+            #    e.g. "2025-08547"
+            job_id = job_link.rsplit("/", 1)[-1]  # everything after last '/'
+            
+            # 5) Check if it's PhD
+            is_phd = is_phd_position(title, "")
+            if not is_phd:
+                continue
+            
+            # 6) Build the job data
+            job_data = {
+                'job_id': job_id,
+                'title': title,
+                'location': location,
+                'team': team,
+                'deadline': deadline,
+                'summary': "",
+                'link': job_link,
+                'keywords': "",
+                'supervisor': "",
+                'funding': "",
+                'is_phd': True,
+                'last_updated': datetime.now().isoformat()
+            }
+
+            details = fetch_job_details(job_link)
+            job_data['supervisor'] = details.get('supervisor', '')
+            job_data['funding'] = details.get('funding', '')
+            job_data['keywords'] = details.get('keywords', '')
+
+            jobs.append(job_data)
+        except Exception as ex:
+            logger.warning(f"Failed to parse job card {idx}: {ex}")
+        time.sleep(0.5)
+    
+    logger.info(f"Collected {len(jobs)} PhD positions from the main page.")
+    return jobs
 
 def fetch_job_details(url):
-    """Fetch detailed information from a job's detail page."""
+    """Fetch detailed information from a job's detail page using text extraction."""
     details = {}
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/91.0.4472.124 Safari/537.36'
+            )
+        }
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
         detail_soup = BeautifulSoup(response.text, 'html.parser')
         logger.debug(f"Fetched details page with status {response.status_code}")
         
-        # Dump the first detail page to debug
-        # if 'debug_dump.html' not in os.listdir():
-        #    with open("debug_dump.html", "w", encoding="utf-8") as f:
-        #        f.write(response.text)
-        
-        # Extract the full description - try different possible selectors
+        # Try to extract the main description from known selectors.
         description_div = None
         for selector in [
             'div.content-offre', 
@@ -133,240 +232,49 @@ def fetch_job_details(url):
                 break
         
         if description_div:
-            full_text = description_div.get_text(strip=True, separator=" ")
-            details['full_description'] = full_text
-            details['keywords'] = extract_keywords(full_text)
-            
-            # Try to find supervisor info from the description
-            supervisor_pattern = re.compile(r'(supervisor|adviser|director|contact):?\s*([^\.]+?)(?=\.|$)', re.IGNORECASE)
-            supervisor_match = supervisor_pattern.search(full_text)
-            if supervisor_match:
-                details['supervisor'] = supervisor_match.group(2).strip()
-            
-            # Try to find funding info
-            funding_pattern = re.compile(r'(funding|grant|scholarship):?\s*([^\.]+?)(?=\.|$)', re.IGNORECASE)
-            funding_match = funding_pattern.search(full_text)
-            if funding_match:
-                details['funding'] = funding_match.group(2).strip()
+            full_text = description_div.get_text(separator=" ", strip=True)
+        else:
+            # Fallback: use the entire page text if no specific container is found.
+            full_text = detail_soup.get_text(separator=" ", strip=True)
         
-        # Check if this is a PhD position
+        details['full_description'] = full_text
+        
+        # Extract PhD Supervisor info: text after "PhD Supervisor :"
+        supervisor_pattern = re.compile(r"PhD Supervisor\s*:\s*([^\n]+)", re.IGNORECASE)
+        supervisor_match = supervisor_pattern.search(full_text)
+        if supervisor_match:
+            details['supervisor'] = supervisor_match.group(1).strip()
+        
+        # Extract funding: text after "remuneration :" and before "euros" or "€"
+        funding_pattern = re.compile(r"Remuneration\s*:\s*([\d\s,\.]+)\s+(euros|€)", re.IGNORECASE)
+        funding_match = funding_pattern.search(full_text)
+        if funding_match:
+            details['funding'] = funding_match.group(1).strip()
+
+        
+        # Extract keywords: text after "Theme/Domain :"
+        keywords_pattern = re.compile(r"Theme/Domain\s*:\s*(.+?)(?=\s{2,}|$)", re.IGNORECASE)
+        keywords_match = keywords_pattern.search(full_text)
+        if keywords_match:
+            details['keywords'] = keywords_match.group(1).strip()
+        
+        # Determine if this is a PhD position using the title (if available) and the full text
         title_element = detail_soup.select_one('h1') or detail_soup.select_one('h2.offer-title')
         title = title_element.get_text(strip=True) if title_element else ""
-        details['is_phd'] = is_phd_position(title, details.get('full_description', ''))
-                
-        # Extract application deadline if available - try various patterns
-        deadline_patterns = [
-            (re.compile(r'deadline', re.IGNORECASE), 'Application deadline:'),
-            (re.compile(r'apply before', re.IGNORECASE), 'Apply before:'),
-            (re.compile(r'apply by', re.IGNORECASE), 'Apply by:')
-        ]
+        details['is_phd'] = is_phd_position(title, full_text)
         
-        for pattern, replace_text in deadline_patterns:
-            deadline_elem = detail_soup.find(string=pattern)
-            if deadline_elem:
-                parent = deadline_elem.parent
-                if parent:
-                    deadline_text = parent.get_text()
-                    details['deadline'] = deadline_text.replace(replace_text, '').strip()
-                    break
-        
-        # Extract research team info if available
-        team_patterns = [
-            (re.compile(r'research team', re.IGNORECASE), 'Research team:'),
-            (re.compile(r'team:', re.IGNORECASE), 'Team:'),
-            (re.compile(r'laboratory', re.IGNORECASE), 'Laboratory:')
-        ]
-        
-        for pattern, replace_text in team_patterns:
-            team_elem = detail_soup.find(string=pattern)
-            if team_elem:
-                parent = team_elem.parent
-                if parent:
-                    team_text = parent.get_text()
-                    details['team'] = team_text.replace(replace_text, '').strip()
-                    break
-            
-        time.sleep(1)  # Be polite with the server
+        # Be polite: sleep a little before returning
+        time.sleep(0.5)
         return details
     except Exception as e:
         logger.error(f"Error fetching job details: {e}")
         return details
 
-def fetch_jobs():
-    """Fetch job offers from the INRIA page and parse them."""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(SCRAPE_URL, headers=headers, timeout=15)
-        response.raise_for_status()
-        logger.info(f"Fetched main page with status {response.status_code}")
-    except requests.RequestException as e:
-        logger.error(f"HTTP error occurred: {e}")
-        return []
-    
-    # Save the HTML for inspection
-    with open("inria_main_page.html", "w", encoding="utf-8") as f:
-        f.write(response.text)
-    logger.info("Saved main page HTML for inspection")
-    
-    soup = BeautifulSoup(response.text, 'html.parser')
-    jobs = []
-    
-    # Try multiple potential selectors for job listings
-    potential_selectors = [
-        "div.list-offers div.offer",
-        "table.offer-table tr.offer-item",
-        "ul.job-list li",
-        "div.job-listing",
-        "article.job-offer"
-    ]
-    
-    job_elements = []
-    used_selector = ""
-    
-    for selector in potential_selectors:
-        job_elements = soup.select(selector)
-        if job_elements:
-            used_selector = selector
-            logger.info(f"Found job elements with selector: {selector}")
-            break
-    
-    if not job_elements:
-        logger.warning("Could not find job listings with any selector. Attempting to find links directly.")
-        # Fallback: look for any links that might contain job offers
-        job_links = soup.select("a[href*='offre']")
-        if job_links:
-            logger.info(f"Found {len(job_links)} potential job links")
-            
-            for link in job_links:
-                try:
-                    job_url = link['href']
-                    if not job_url.startswith('http'):
-                        job_url = f"https://jobs.inria.fr{job_url}" if job_url.startswith('/') else f"https://jobs.inria.fr/{job_url}"
-                    
-                    job_id = re.search(r'offre/(\w+)', job_url)
-                    job_id = job_id.group(1) if job_id else f"job-{len(jobs)}"
-                    
-                    title = link.get_text(strip=True)
-                    if not title:
-                        title = f"Job {job_id}"
-                    
-                    # Get the details page
-                    details = fetch_job_details(job_url)
-                    
-                    # Only include PhD positions
-                    if not details.get('is_phd', False) and not is_phd_position(title, ''):
-                        continue
-                    
-                    # Create a summary of the job description
-                    summary = create_summary(details.get('full_description', ''))
-                    
-                    jobs.append({
-                        'job_id': job_id,
-                        'title': title,
-                        'location': "Unknown",  # We'll need to extract this from details
-                        'team': details.get('team', ''),
-                        'posted_date': "Unknown",
-                        'deadline': details.get('deadline', ''),
-                        'summary': summary,
-                        'link': job_url,
-                        'keywords': details.get('keywords', ''),
-                        'supervisor': details.get('supervisor', ''),
-                        'funding': details.get('funding', ''),
-                        'is_phd': True,
-                        'last_updated': datetime.now().isoformat()
-                    })
-                    
-                    # Be polite with the server
-                    time.sleep(2)
-                except Exception as ex:
-                    logger.warning(f"Failed to process job link: {ex}")
-            
-            logger.info(f"Extracted {len(jobs)} PhD positions from links")
-            return jobs
-    
-    # Process the job elements if found with a selector
-    for job_elem in job_elements:
-        try:
-            # Extract data based on the selector that worked
-            if used_selector == "div.list-offers div.offer":
-                # Process offers from div.list-offers
-                title_elem = job_elem.select_one("h3.title") or job_elem.select_one("div.title")
-                link_elem = job_elem.select_one("a")
-                location_elem = job_elem.select_one("div.location") or job_elem.select_one("span.location")
-                date_elem = job_elem.select_one("div.date") or job_elem.select_one("span.date")
-                
-            elif used_selector == "table.offer-table tr.offer-item":
-                # Process offers from table.offer-table
-                title_elem = job_elem.select_one("td.offer-title a")
-                link_elem = title_elem
-                location_elem = job_elem.select_one("td.offer-location")
-                date_elem = job_elem.select_one("td.offer-date")
-                
-            else:
-                # Generic approach for other selectors
-                title_elem = job_elem.select_one("h3") or job_elem.select_one("h4") or job_elem.select_one("div.title")
-                link_elem = job_elem.select_one("a")
-                location_elem = job_elem.select_one("div.location") or job_elem.select_one("span.location")
-                date_elem = job_elem.select_one("div.date") or job_elem.select_one("span.date")
-            
-            # Skip if we don't have title or link
-            if not title_elem or not link_elem:
-                continue
-                
-            title = title_elem.get_text(strip=True)
-            
-            # Get link
-            link = link_elem['href']
-            if not link.startswith('http'):
-                link = f"https://jobs.inria.fr{link}" if link.startswith('/') else f"https://jobs.inria.fr/{link}"
-            
-            # Extract job_id from the link or element id
-            job_id = job_elem.get('id', '')
-            if not job_id:
-                job_id_match = re.search(r'offre/(\w+)', link)
-                job_id = job_id_match.group(1) if job_id_match else f"job-{len(jobs)}"
-            job_id = job_id.replace('offer-', '')
-            
-            # Get location and date
-            location = location_elem.get_text(strip=True) if location_elem else "Unknown"
-            posted_date = date_elem.get_text(strip=True) if date_elem else "Unknown"
-            
-            logger.info(f"Processing job: {title}")
-            
-            # Get additional details from the job's detail page
-            details = fetch_job_details(link)
-            
-            # Only include PhD positions
-            if not details.get('is_phd', False) and not is_phd_position(title, details.get('full_description', '')):
-                logger.debug(f"Skipping non-PhD position: {title}")
-                continue
-            
-            # Create a summary of the job description
-            summary = create_summary(details.get('full_description', ''))
-            
-            jobs.append({
-                'job_id': job_id,
-                'title': title,
-                'location': location,
-                'team': details.get('team', ''),
-                'posted_date': posted_date,
-                'deadline': details.get('deadline', ''),
-                'summary': summary,
-                'link': link,
-                'keywords': details.get('keywords', ''),
-                'supervisor': details.get('supervisor', ''),
-                'funding': details.get('funding', ''),
-                'is_phd': True,
-                'last_updated': datetime.now().isoformat()
-            })
-            
-            # Be polite with the server
-            time.sleep(2)
-        except Exception as ex:
-            logger.warning(f"Failed to parse a job offer: {ex}")
-    
-    logger.info(f"Fetched {len(jobs)} PhD positions")
-    return jobs
+
+def reset_database_file():
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+        logger.info("Existing database file removed.")
 
 def update_database(jobs):
     """Insert new jobs or update existing ones in the database."""
@@ -385,12 +293,12 @@ def update_database(jobs):
                 # New job
                 c.execute('''
                     INSERT INTO jobs (
-                        job_id, title, location, team, posted_date, deadline, 
+                        job_id, title, location, team, deadline, 
                         summary, link, keywords, supervisor, funding, is_phd, last_updated
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    job['job_id'], job['title'], job['location'], job.get('team', ''), job['posted_date'], 
+                    job['job_id'], job['title'], job['location'], job.get('team', ''), 
                     job.get('deadline', ''), job['summary'], job['link'], job.get('keywords', ''),
                     job.get('supervisor', ''), job.get('funding', ''), job.get('is_phd', True), job['last_updated']
                 ))
@@ -399,12 +307,12 @@ def update_database(jobs):
                 # Update existing job
                 c.execute('''
                     UPDATE jobs
-                    SET title = ?, location = ?, team = ?, posted_date = ?, deadline = ?, 
+                    SET title = ?, location = ?, team = ?, deadline = ?, 
                         summary = ?, link = ?, keywords = ?, supervisor = ?, funding = ?, 
                         is_phd = ?, last_updated = ?
                     WHERE job_id = ?
                 ''', (
-                    job['title'], job['location'], job.get('team', ''), job['posted_date'], 
+                    job['title'], job['location'], job.get('team', ''),
                     job.get('deadline', ''), job['summary'], job['link'], job.get('keywords', ''),
                     job.get('supervisor', ''), job.get('funding', ''), job.get('is_phd', True), 
                     job['last_updated'], job['job_id']
@@ -419,6 +327,8 @@ def update_database(jobs):
     return new_jobs
 
 def export_to_excel():
+
+
     """Export the current job data from the database to an Excel file with a timestamped filename."""
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("SELECT * FROM jobs WHERE is_phd = 1", conn)
@@ -467,7 +377,6 @@ def export_to_excel():
         worksheet.set_column('B:B', 40)  # Title column
         worksheet.set_column('C:C', 15)  # Location
         worksheet.set_column('D:D', 15)  # Team
-        worksheet.set_column('E:E', 12)  # Posted date
         worksheet.set_column('F:F', 12)  # Deadline
         worksheet.set_column('G:G', 60)  # Summary
         worksheet.set_column('H:H', 40)  # Link
@@ -479,6 +388,8 @@ def export_to_excel():
     return filename
 
 def main():
+    # Reset the database file
+    reset_database_file()
     # Initialize DB if necessary
     init_db()
     
